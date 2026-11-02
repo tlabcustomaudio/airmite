@@ -9,6 +9,7 @@ substitutions:
   friendly_name: AirMite
   t_offset: "0"
   rh_offset: "0"
+  bat_factor: "2.0"           # battery divider: 2.0 = 220k/220k
 
 dashboard_import:
   package_import_url: github://tlabcustomaudio/airmite/firmware/airmite-battery.yaml@main
@@ -69,7 +70,7 @@ number:
     min_value: 1.0
     max_value: 4.0
     step: 0.001
-    initial_value: 2.0
+    initial_value: ${bat_factor}
     optimistic: true
     restore_value: true
     mode: box
@@ -175,7 +176,15 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
     entity_category: config
-    # turn ON in HA before an OTA update, OFF again after
+    # turn ON in HA before an OTA update, OFF again after: OFF sends it straight back to
+    # sleep (a steady HA connection would never re-fire on_client_connected)
+    on_turn_off:
+      - if:
+          condition:
+            binary_sensor.is_off: usb_power
+          then:
+            - delay: 2s
+            - deep_sleep.enter: sleep_1
 
 # The 15-minute duty cycle. Sleep is entered ONLY by the actions above (on_client_connected,
 # the on_boot failsafe, and the low-voltage guard) — there is deliberately no run_duration,

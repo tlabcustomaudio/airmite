@@ -1,4 +1,9 @@
-# AirMite
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/airmite-wordmark-dark.svg">
+    <img alt="AirMite" src="docs/logo/airmite-wordmark-light.svg" width="420">
+  </picture>
+</h1>
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buymeacoffee)](https://buymeacoffee.com/tlabcustom)
 
@@ -26,7 +31,7 @@ match: `sensor.<room>_temperature`, `sensor.<room>_absolute_humidity`.
 Every variant shows these entities in Home Assistant:
 - **Temperature**, **Humidity**, **Absolute humidity**.
 - **Temperature offset** and **Humidity offset** (settings).
-- The battery variant also has **Battery** (%), **Battery Voltage**, **USB Power**, **Battery divider factor** and **Prevent Deep Sleep**.
+- The battery variant also has **Battery** (%), **Battery Voltage**, **USB Power**, **Battery divider factor** and **Prevent Deep Sleep**. Turn Prevent Deep Sleep on to keep it awake for an update; turning it off sends it back to sleep.
 
 Enclosures (3D-printable) are coming on MakerWorld; the link will be here.
 
@@ -120,7 +125,14 @@ adds only what is different:
 esphome run firmware/airmite-usb.yaml
 ```
 
-No `secrets.yaml` needed. `tools/drawings.py` redraws the pictures in `docs/` (needs matplotlib).
+No `secrets.yaml` needed. `tools/drawings.py` redraws the pictures in `docs/` and `tools/logo.py`
+the wordmark (matplotlib + fontTools).
+
+Using AirMite for your own sensors with your own keys and fixed IPs: write a small config that
+includes the variant as a package and adds `api: encryption`, an OTA password and `wifi: manual_ip`.
+Set `name_add_mac_suffix: false` to keep a fixed hostname. Firmware substitutions you can set:
+`name`, `friendly_name`, `t_offset`, `rh_offset` (starting offsets) and, on the battery variant,
+`bat_factor`.
 
 **Security note:** shared firmware cannot carry your keys, so the API has no encryption key and
 OTA has no password. Anyone on your local network could read or reflash the sensor. If that
@@ -128,6 +140,7 @@ matters to you, add `api: encryption: key:` and an OTA password in your own copy
 
 ## License
 
-MIT. Made by [T Lab](https://github.com/tlabcustomaudio).
+MIT. Made by [T Lab](https://github.com/tlabcustomaudio). The wordmark uses
+[Outfit](https://fonts.google.com/specimen/Outfit) (SIL Open Font License), converted to outlines.
 
 If AirMite saves you time, you can support it on [Buy Me a Coffee](https://buymeacoffee.com/tlabcustom).
