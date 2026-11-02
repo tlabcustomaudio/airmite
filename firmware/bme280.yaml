@@ -1,0 +1,31 @@
+# BME280: temperature, humidity, pressure (+ absolute humidity). Included by airmite-outdoor.
+# Humidity follows the temperature offset (self-heating): same water content at the
+# corrected temperature (Magnus), then the humidity offset on top.
+sensor:
+  - platform: bme280_i2c
+    id: env
+    address: 0x76             # 0x77 if your breakout has SDO tied high
+    update_interval: 30s
+    temperature:
+      id: env_t
+      name: Temperature
+      oversampling: 16x
+      filters:
+        - lambda: return x + id(t_off).state;
+    humidity:
+      id: env_rh
+      name: Humidity
+      oversampling: 16x
+      filters:
+        - lambda: |-
+            float t = id(env_t).raw_state;
+            if (isnan(t)) return x;
+            auto es = [](float c) { return expf(17.62f * c / (243.12f + c)); };
+            return clamp(x * es(t) / es(t + id(t_off).state) + id(rh_off).state, 0.0f, 100.0f);
+    pressure:
+      id: env_p
+      name: Pressure
+  - platform: absolute_humidity
+    name: Absolute humidity
+    temperature: env_t
+    humidity: env_rh

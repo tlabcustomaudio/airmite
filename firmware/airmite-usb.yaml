@@ -10,6 +10,7 @@ dashboard_import:
 
 packages:
   common: !include common.yaml
+  sensor: !include sht4x.yaml
 
 esp32:
   board: esp32-c3-devkitm-1

@@ -16,6 +16,7 @@ dashboard_import:
 
 packages:
   common: !include common.yaml
+  sensor: !include sht4x.yaml
 
 esphome:
   on_boot:
@@ -44,7 +45,7 @@ preferences:
 
 api:
   on_client_connected:
-    - component.update: sht
+    - component.update: env
     - component.update: bat_v
     - delay: 2s
     - if:
@@ -77,7 +78,7 @@ number:
     entity_category: config
 
 sensor:
-  - id: !extend sht
+  - id: !extend env
     update_interval: 60s
 
   # Read with the radio up, so the cell reads ~30mV low under wifi bursts —

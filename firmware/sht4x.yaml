@@ -1,0 +1,20 @@
+# SHT40/41: temperature + humidity (+ absolute humidity). Included by the indoor variants.
+sensor:
+  - platform: sht4x
+    id: env
+    update_interval: 30s
+    temperature:
+      id: sht_t
+      name: Temperature
+      filters:
+        - lambda: return x + id(t_off).state;
+    humidity:
+      id: sht_rh
+      name: Humidity
+      filters:
+        - lambda: return clamp(x + id(rh_off).state, 0.0f, 100.0f);
+  # g/m3: what CapillAir compares indoors vs outdoors (unlike %RH it does not move with temperature)
+  - platform: absolute_humidity
+    name: Absolute humidity
+    temperature: sht_t
+    humidity: sht_rh

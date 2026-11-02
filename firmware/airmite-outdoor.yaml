@@ -1,0 +1,36 @@
+# ESP32-C3 SuperMini PLUS + BME280 on USB, always on: outdoor sensor with pressure.
+# Same wiring as every variant: SDA GPIO5, SCL GPIO6, 3V3, GND. Keep the BME280 on a
+# short cable away from the board (radiation shield / Stevenson screen outside).
+substitutions:
+  name: airmite-outdoor
+  friendly_name: AirMite Outdoor
+  t_offset: "0"
+  rh_offset: "0"
+
+dashboard_import:
+  package_import_url: github://tlabcustomaudio/airmite/firmware/airmite-outdoor.yaml@main
+
+packages:
+  common: !include common.yaml
+  sensor: !include bme280.yaml
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  cpu_frequency: 80MHZ       # less self-heating
+  framework:
+    type: esp-idf
+
+wifi:
+  power_save_mode: light
+
+# GPIO8 on the Plus is a WS2812 RGB LED: with no data it glows faint blue.
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    pin: GPIO8
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    internal: true

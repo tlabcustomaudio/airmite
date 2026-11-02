@@ -3,6 +3,7 @@
 # Configuration). Board files set the substitutions below and include this file.
 #
 # substitutions expected: name, friendly_name, t_offset, rh_offset
+# The sensor itself (id env) comes from sht4x.yaml or bme280.yaml.
 
 esphome:
   name: ${name}
@@ -51,7 +52,7 @@ number:
     mode: box
     entity_category: config
     on_value:
-      - component.update: sht
+      - component.update: env
   - platform: template
     id: rh_off
     name: Humidity offset
@@ -66,24 +67,5 @@ number:
     mode: box
     entity_category: config
     on_value:
-      - component.update: sht
+      - component.update: env
 
-sensor:
-  - platform: sht4x
-    id: sht
-    update_interval: 30s
-    temperature:
-      id: sht_t
-      name: Temperature
-      filters:
-        - lambda: return x + id(t_off).state;
-    humidity:
-      id: sht_rh
-      name: Humidity
-      filters:
-        - lambda: return clamp(x + id(rh_off).state, 0.0f, 100.0f);
-  # g/m3: what CapillAir compares indoors vs outdoors (unlike %RH it does not move with temperature)
-  - platform: absolute_humidity
-    name: Absolute humidity
-    temperature: sht_t
-    humidity: sht_rh

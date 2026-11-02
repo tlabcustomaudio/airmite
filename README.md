@@ -8,7 +8,7 @@
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-yellow?logo=buymeacoffee)](https://buymeacoffee.com/tlabcustom)
 
 Tiny temperature + humidity sensors for **Home Assistant**, built on an ESP32-C3 and a
-Sensirion SHT40/41. You don't need to write any code or edit any files:
+Sensirion SHT40/41 (or a Bosch BME280 outdoors, with pressure). You don't need to write any code or edit any files:
 
 1. flash the firmware from the browser,
 2. type in your Wi-Fi,
@@ -26,24 +26,28 @@ match: `sensor.<room>_temperature`, `sensor.<room>_absolute_humidity`.
 |---|---|---|---|
 | **AirMite USB** | ESP32-C3 SuperMini | USB-C, always on, updates every 30 s | [airmite-usb.factory.bin](https://github.com/tlabcustomaudio/airmite/releases/latest/download/airmite-usb.factory.bin) |
 | **AirMite USB Plus** | ESP32-C3 SuperMini **Plus** | USB-C, always on, updates every 30 s | [airmite-usb-plus.factory.bin](https://github.com/tlabcustomaudio/airmite/releases/latest/download/airmite-usb-plus.factory.bin) |
+| **AirMite Outdoor** | ESP32-C3 SuperMini **Plus** + **BME280** | USB-C, always on, updates every 30 s, adds **Pressure** | [airmite-outdoor.factory.bin](https://github.com/tlabcustomaudio/airmite/releases/latest/download/airmite-outdoor.factory.bin) |
 | **AirMite Battery** | Seeed Studio XIAO ESP32-C3 | 1S LiPo, wakes every 15 min (months per charge), charges from USB-C | [airmite-battery.factory.bin](https://github.com/tlabcustomaudio/airmite/releases/latest/download/airmite-battery.factory.bin) |
 
 Every variant shows these entities in Home Assistant:
 - **Temperature**, **Humidity**, **Absolute humidity**.
 - **Temperature offset** and **Humidity offset** (settings).
+- The outdoor variant also has **Pressure** (hPa).
 - The battery variant also has **Battery** (%), **Battery Voltage**, **USB Power**, **Battery divider factor** and **Prevent Deep Sleep**. Turn Prevent Deep Sleep on to keep it awake for an update; turning it off sends it back to sleep.
 
 Enclosures (3D-printable) are coming on MakerWorld; the link will be here.
 
 ## Parts
 
-| Part | USB | Battery |
-|---|---|---|
-| ESP32-C3 board | SuperMini or SuperMini Plus | Seeed XIAO ESP32-C3 (with its IPEX antenna) |
-| SHT40 or SHT41 breakout (I2C, with pull-ups) | 1 | 1 |
-| LiPo 3.7 V 1S, ~300–1000 mAh | – | 1 |
-| Resistors | – | 2× 220k, 1× 100k, 1× 150k |
-| Wire, USB-C cable / power supply | ✓ | ✓ (to charge) |
+| Part | USB | Outdoor | Battery |
+|---|---|---|---|
+| ESP32-C3 board | SuperMini or SuperMini Plus | SuperMini Plus | Seeed XIAO ESP32-C3 (with its IPEX antenna) |
+| SHT40 or SHT41 breakout (I2C, with pull-ups) | 1 | – | 1 |
+| BME280 breakout (I2C, 3.3 V, address 0x76) | – | 1 | – |
+| Radiation shield (Stevenson screen) | – | ✓ | – |
+| LiPo 3.7 V 1S, ~300–1000 mAh | – | – | 1 |
+| Resistors | – | – | 2× 220k, 1× 100k, 1× 150k |
+| Wire, USB-C cable / power supply | ✓ | ✓ | ✓ (to charge) |
 
 ## Wiring
 
@@ -55,6 +59,12 @@ All variants use the same sensor wiring: **SDA → GPIO5**, **SCL → GPIO6**, *
 ![Wiring, USB](docs/wiring-usb.png)
 
 ![Schematic, USB](docs/schematic-usb.png)
+
+### AirMite Outdoor
+
+Same four wires as the USB picture, with a BME280 in place of the SHT41. Not GPIO8/9: on the
+Plus, GPIO8 drives the RGB LED, and I2C traffic there lights it up and warms the sensor.
+The firmware expects address 0x76 (most breakouts); a board with SDO tied high is 0x77.
 
 ### AirMite Battery
 
@@ -103,6 +113,10 @@ The sensor stores the offsets itself, so they survive reboots, power cuts and fi
 
 **USB Plus** starts at −1.7 °C / +3.8 %, measured on one board. Check yours anyway.
 
+**Outdoor:** calibrate it indoors next to the reference, before you mount it outside. The
+humidity reading follows the temperature offset by itself (same water content at the corrected
+temperature), so the humidity offset is only what is left after that.
+
 **Battery:** the board is awake only a few seconds every 15 minutes. To change a setting, plug
 USB in (it then stays awake), change it, and unplug.
 
@@ -118,8 +132,8 @@ Without it, flash the new `.factory.bin` over USB as in step 1. The stored offse
 
 ## Build it yourself
 
-`firmware/` holds plain ESPHome configs. `common.yaml` is the shared part, and each board file
-adds only what is different:
+`firmware/` holds plain ESPHome configs. `common.yaml` is the shared part, `sht4x.yaml` / `bme280.yaml` the
+sensor, and each board file adds only what is different:
 
 ```bash
 esphome run firmware/airmite-usb.yaml
