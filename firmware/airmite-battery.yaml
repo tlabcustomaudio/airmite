@@ -1,0 +1,192 @@
+# Seeed XIAO ESP32-C3 + SHT40/41 on a 1S LiPo, deep sleep 15 min (months per charge).
+# SHT41: SDA D3/GPIO5, SCL D4/GPIO6. Battery: divider to D1/GPIO3. USB sense: 5V pad
+# -> 100k/150k divider -> D2/GPIO4 (plugged in = stays awake).
+#
+# Changing settings from HA: the sensor is awake only a few seconds every 15 min.
+# Plug USB in (it then stays awake), change the offsets, unplug.
+substitutions:
+  name: airmite-battery
+  friendly_name: AirMite
+  t_offset: "0"
+  rh_offset: "0"
+
+dashboard_import:
+  package_import_url: github://tlabcustomaudio/airmite/firmware/airmite-battery.yaml@main
+
+packages:
+  common: !include common.yaml
+
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      - component.update: bat_v
+      - delay: 30s
+      - if:
+          condition:
+            and:
+              - switch.is_off: prevent_sleep
+              - binary_sensor.is_off: usb_power
+          then:
+            - logger.log: "No client connected in 30s: sleeping anyway"
+            - deep_sleep.enter: sleep_1
+
+esp32:
+  board: seeed_xiao_esp32c3
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+# settings changed from HA are written to flash within seconds, before the next sleep
+preferences:
+  flash_write_interval: 5s
+
+api:
+  on_client_connected:
+    - component.update: sht
+    - component.update: bat_v
+    - delay: 2s
+    - if:
+        condition:
+          and:
+            - switch.is_off: prevent_sleep
+            - binary_sensor.is_off: usb_power
+        then:
+          - deep_sleep.enter: sleep_1
+
+# an OTA'd image is confirmed only after this; the default 60 s is longer than a wake
+safe_mode:
+  boot_is_good_after: 5s
+
+wifi:
+  fast_connect: true
+
+number:
+  - platform: template
+    id: bat_k
+    name: Battery divider factor
+    icon: mdi:battery-sync
+    min_value: 1.0
+    max_value: 4.0
+    step: 0.001
+    initial_value: 2.0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+sensor:
+  - id: !extend sht
+    update_interval: 60s
+
+  # Read with the radio up, so the cell reads ~30mV low under wifi bursts —
+  # enough to move the % a few points at the knee. Read it in on_boot (priority 500,
+  # before wifi) into a global if that ever matters.
+  - platform: adc
+    id: bat_v
+    name: Battery Voltage
+    pin: GPIO3                # D1. NOT D0/GPIO2: strapping pin, a divider on it can
+                              # hold the board out of boot.
+    attenuation: 12db         # 0-3.1V; a full 4.2V cell lands at 2.10V through the
+                              # 220k/220k divider: inside range.
+    update_interval: 60s
+    accuracy_decimals: 3
+    samples: 16               # the Seeed forum saw spike-like errors during radio
+                              # traffic; 16x averaging removes them. Matters here because
+                              # a spurious low reading would park the board (see on_value).
+    filters:
+      # divider factor from HA (Battery divider factor): 2.0 for 220k/220k. Check it with
+      # USB in: the cell sits at 4.20 V, so factor = 4.20 / the pin voltage.
+      - lambda: return x * id(bat_k).state;
+    # Drive the % off this reading instead of a second timer. Both on 60s raced at boot:
+    # bat_pct fired first, read a NaN bat_v and published nan. On USB that heals in a
+    # minute, but with deep_sleep the wake is only run_duration long — a lost tick means
+    # the whole wake reports nan.
+    on_value:
+      then:
+        - component.update: bat_pct
+        # OVER-DISCHARGE CUTOFF. The onboard ETA4054 has none, and a bare pouch cell
+        # (no protection PCB) has none either, so this is the
+        # only thing standing between it and permanent damage below ~2.5V.
+        # At 3.40V (~3% on the curve) park in deep sleep and wait for USB. Residual draw
+        # is then ~13uA, which is ~48 days of grace from the ~15mAh still in the cell.
+        # NOT gated on prevent_sleep: that switch is an OTA convenience and must not be
+        # able to disable a safety cutoff. To service a flat board, plug USB in — that
+        # both wakes it and stops the guard firing.
+        - if:
+            condition:
+              and:
+                - lambda: 'return x < 3.40f;'
+                - binary_sensor.is_off: usb_power
+            then:
+              - logger.log: "Battery below 3.40V: parking until USB is connected"
+              # 24h, NOT the 15min duty cycle it would otherwise inherit: a flat cell must
+              # stop waking. USB still wakes it instantly via the wakeup pin, so the long
+              # duration costs nothing in responsiveness.
+              - deep_sleep.enter:
+                  id: sleep_1
+                  sleep_duration: 24h
+
+  - platform: template
+    id: bat_pct
+    name: Battery
+    device_class: battery
+    unit_of_measurement: '%'
+    accuracy_decimals: 0
+    update_interval: never    # published by bat_v's on_value, never on its own clock
+    # Resting 1S LiPo curve, linear between the points. Below 2.5V there is no cell
+    # on the pads: report unknown rather than 0%, or HA fires every low alert at once.
+    lambda: |-
+      static const float V[] = {3.30,3.50,3.60,3.68,3.74,3.77,3.82,3.87,3.92,3.98,4.06,4.20};
+      static const float P[] = {   0,   3,   5,  10,  20,  30,  50,  60,  70,  80,  90, 100};
+      float v = id(bat_v).state;
+      if (isnan(v) || v < 2.5f) return NAN;
+      if (v <= V[0]) return 0.0f;
+      for (int i = 1; i < 12; i++)
+        if (v < V[i])
+          return P[i-1] + (P[i] - P[i-1]) * (v - V[i-1]) / (V[i] - V[i-1]);
+      return 100.0f;
+
+binary_sensor:
+  - platform: gpio
+    id: usb_power
+    name: USB Power
+    device_class: plug
+    pin:                      # D2, off a 100k/150k divider on the 5V pad: 3.0V with
+      number: GPIO4           # USB in, 0V without. No internal pull — the divider
+                              # holds it down on its own.
+      allow_other_uses: true  # shared with deep_sleep's wakeup_pin below
+    on_release:
+      # Unplugging USB is the ONE transition with no other route into sleep:
+      # on_client_connected needs a NEW client (a steady HA connection never re-fires),
+      # and the on_boot failsafe ran long ago while USB was still in. Without this the
+      # board stays awake on battery until something reconnects — ~6h to flat.
+      - if:
+          condition:
+            switch.is_off: prevent_sleep
+          then:
+            - logger.log: "USB removed: entering the duty cycle"
+            - deep_sleep.enter: sleep_1
+
+switch:
+  - platform: template
+    name: Prevent Deep Sleep
+    id: prevent_sleep
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    # turn ON in HA before an OTA update, OFF again after
+
+# The 15-minute duty cycle. Sleep is entered ONLY by the actions above (on_client_connected,
+# the on_boot failsafe, and the low-voltage guard) — there is deliberately no run_duration,
+# because that timer ignores usb_power and would sleep the board while it is plugged in.
+# Reflashing over USB while asleep: the port vanishes, RTS reset won't help — replug clean.
+deep_sleep:
+  id: sleep_1
+  sleep_duration: 15min
+  wakeup_pin:                 # plug USB in and it wakes at once instead of at the next tick
+    number: GPIO4
+    allow_other_uses: true
+  # IGNORE, not KEEP_AWAKE: KEEP_AWAKE only defers when there is no sleep_duration, and
+  # there now is one. The explicit usb_power conditions above are what keep it awake.
+  wakeup_pin_mode: IGNORE

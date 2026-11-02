@@ -1,0 +1,22 @@
+# ESP32-C3 SuperMini + SHT40/41 on USB, always on. SHT41: SDA GPIO5, SCL GPIO6, 3V3, GND.
+substitutions:
+  name: airmite
+  friendly_name: AirMite
+  t_offset: "0"
+  rh_offset: "0"
+
+dashboard_import:
+  package_import_url: github://tlabcustomaudio/airmite/firmware/airmite-usb.yaml@main
+
+packages:
+  common: !include common.yaml
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  cpu_frequency: 80MHZ       # less self-heating next to the SHT41
+  framework:
+    type: esp-idf
+
+wifi:
+  power_save_mode: light

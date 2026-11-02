@@ -1,0 +1,25 @@
+# ESP32-C3 SuperMini PLUS + SHT40/41 on USB. Same wiring as airmite-usb.yaml.
+# Always on, the Plus warms its own sensor: these start offsets were measured on one
+# board against a reference (1 h side by side). Fine-tune yours in HA.
+substitutions:
+  name: airmite
+  friendly_name: AirMite
+  t_offset: "-1.7"
+  rh_offset: "3.8"
+
+dashboard_import:
+  package_import_url: github://tlabcustomaudio/airmite/firmware/airmite-usb-plus.yaml@main
+
+packages:
+  base: !include airmite-usb.yaml
+
+# GPIO8 on the Plus is a WS2812 RGB LED: with no data it glows faint blue.
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    pin: GPIO8
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    internal: true

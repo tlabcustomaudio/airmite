@@ -1,0 +1,89 @@
+# AirMite: shared part of every variant: Wi-Fi setup without editing files, and the
+# calibration offsets as Home Assistant entities (Settings > Devices > the sensor >
+# Configuration). Board files set the substitutions below and include this file.
+#
+# substitutions expected: name, friendly_name, t_offset, rh_offset
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true   # several sensors on one network never clash
+  project:
+    name: tlabcustomaudio.airmite
+    version: "1.0"
+
+logger:
+
+# No key on purpose: shared firmware cannot carry anyone's secrets. HA finds the
+# sensor by itself (Settings > Devices > Discovered); pick the room (area) there.
+api:
+
+ota:
+  - platform: esphome
+
+# No credentials in the firmware: set Wi-Fi from web.esphome.io over USB (Improv),
+# or join the "AirMite setup" hotspot from a phone and pick the network.
+wifi:
+  ap:
+    ssid: "AirMite setup"
+captive_portal:
+improv_serial:
+
+i2c:
+  sda: GPIO5
+  scl: GPIO6
+  frequency: 100kHz
+
+# Offsets: compare the sensor with a thermometer you trust for an hour, then set
+# the difference here. Kept in the sensor's flash, survive reboots and updates.
+number:
+  - platform: template
+    id: t_off
+    name: Temperature offset
+    icon: mdi:thermometer-plus
+    unit_of_measurement: "°C"
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    initial_value: ${t_offset}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - component.update: sht
+  - platform: template
+    id: rh_off
+    name: Humidity offset
+    icon: mdi:water-plus
+    unit_of_measurement: "%"
+    min_value: -20
+    max_value: 20
+    step: 0.1
+    initial_value: ${rh_offset}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    on_value:
+      - component.update: sht
+
+sensor:
+  - platform: sht4x
+    id: sht
+    update_interval: 30s
+    temperature:
+      id: sht_t
+      name: Temperature
+      filters:
+        - lambda: return x + id(t_off).state;
+    humidity:
+      id: sht_rh
+      name: Humidity
+      filters:
+        - lambda: return clamp(x + id(rh_off).state, 0.0f, 100.0f);
+  # g/m3: what CapillAir compares indoors vs outdoors (unlike %RH it does not move with temperature)
+  - platform: absolute_humidity
+    name: Absolute humidity
+    temperature: sht_t
+    humidity: sht_rh
