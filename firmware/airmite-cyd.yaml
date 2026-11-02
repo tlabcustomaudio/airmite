@@ -1,0 +1,2672 @@
+# AirMite CYD: Guition ESP32-2432S028R ("Cheap Yellow Display", 2.8" touch) + Sensirion SCD41.
+# Shows temperature, humidity and CO2, and has two buttons that drive Home Assistant:
+# HEAT and COOL (hold 0.8 s to toggle the entity you choose below).
+#
+# BEFORE THE BUTTONS WORK: in HA, Settings > Devices > ESPHome > this device >
+# Configure > tick "Allow the device to perform Home Assistant actions".
+# Without it the buttons do nothing and nothing is logged anywhere.
+#
+# No secrets in here: set Wi-Fi on the screen (gear > WIFI), from web.esphome.io (Improv)
+# or from the "AirMite setup" hotspot.
+
+substitutions:
+  name: airmite-cyd
+  friendly_name: AirMite CYD
+  bl_heat_c: "0.85"       # degC the backlight at 100 % adds inside the printed case (measured)
+  # What the two buttons toggle (homeassistant.toggle: switch, input_boolean, light, fan,
+  # climate...). Lit when the entity is not off. Default ids: make a helper with this id in HA,
+  # or build your own config with these two lines changed.
+  heat_entity: switch.heat
+  cool_entity: switch.cool
+
+  # CO2 thresholds in ppm: below the first green, between them yellow, above red.
+  # Anchors: outdoor air sits near 420 ppm, so a room never reads lower. 1000 ppm
+  # is the classic ASHRAE comfort limit (stuffy smell, not enough fresh air) and
+  # cognitive studies start measuring decrements between 1000 and 1400. The real
+  # safety limit (5000 ppm, 8 h occupational exposure) is an order of magnitude
+  # away: this is about comfort, not danger. 800/1200 puts yellow astride 1000,
+  # so it lights up BEFORE the air is stale - when opening a window still helps.
+  # Where the alerts go. notify.persistent_notification reaches every HA user
+  # in the UI. For push to phones, point this at a notify group containing each
+  # person's companion-app target (notify.mobile_app_*) and change this line.
+  notify_action: notify.persistent_notification
+
+  # Your height above sea level. The SCD41 needs it to compensate the CO2
+  # reading; a few hundred metres out is worth a few tens of ppm.
+  altitude: 200m
+
+  co2_good: "800"                       # below this: green
+  co2_bad: "1200"                       # above this: red
+
+  # Full-screen clock alternating with the values (switch "Alternate clock").
+  data_s: "20"                          # seconds on the values
+  clock_s: "10"                         # seconds on the clock
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true   # several sensors on one network never clash
+  project:
+    name: tlabcustomaudio.airmite
+    version: "1.0"
+  includes:
+    - cyd-helpers.h              # time_in_window(), wifi scan, skins
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# The 2432S028R has no PSRAM: no psram block, and the LVGL buffer stays small.
+# Mains powered over USB, so there is no deep sleep anywhere in here: the screen
+# stays up and only dims on idle. Give it a supply that can really do 5 V / 1 A -
+# the panel plus backlight plus wifi peaks are what brown these boards out.
+
+logger:
+  baud_rate: 115200
+
+# No key on purpose: shared firmware cannot carry anyone's secrets. HA finds the
+# sensor by itself (Settings > Devices > Discovered); pick the room (area) there.
+api:
+
+ota:
+  - platform: esphome
+
+# If a bad firmware makes the device crash-loop, safe mode boots with wifi+OTA
+# only, so the next update can go through. On a wall-mounted display this is
+# the difference between an OTA rollback and unscrewing the thing.
+safe_mode:
+  num_attempts: 5
+  boot_is_good_after: 1min
+
+wifi:
+  # No credentials in the firmware (2.4 GHz only: the ESP32 has no 5 GHz radio).
+  ap:
+    ssid: "AirMite setup"
+  # 2026-10-18: the screen flickered right before and after each reading: the
+  # SCD41 burst and the wifi TX peak sag the 3V3 rail that also feeds the
+  # backlight. 15 dB instead of the 20 dB default halves the TX peak. If it still
+  # flickers, the hardware fix is ~220 uF across 3V3/GND at the SCD41 plug.
+  output_power: 15dB
+
+captive_portal:
+improv_serial:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      - seconds: 0                 # every minute, on the minute
+        then:
+          - script.execute: set_clock
+          # and re-check the backlight, or an idle screen stays lit past the start
+          # of the night window until someone touches it (2026-10-18)
+          - script.execute: apply_backlight
+
+# ---------------------------------------------------------------- hardware
+
+spi:
+  - id: lcd_bus                    # display
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: touch_bus                  # the touch controller has its OWN bus, not shared
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+i2c:
+  # CN1, the connector on the board edge. It is the only free I2C here: LCD,
+  # touch, LDR, speaker and SD take everything else.
+  #
+  # SDA is GPIO27 and SCL is GPIO22, verified on the bench 2026-08-26: with
+  # sda/scl the other way round the bus scan reports "Found no devices", and
+  # swapping them finds the SCD41 at 0x62 immediately. Do not "fix" this back
+  # to GPIO22/GPIO27 to match the pinout note without rescanning first.
+  id: cn1_bus
+  sda: GPIO27
+  scl: GPIO22
+  frequency: 50kHz                 # slow enough for a few tens of cm of cable
+
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: bl_out
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    output: bl_out
+    id: backlight
+    name: Backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 400ms
+
+display:
+  - platform: ili9xxx
+    id: lcd
+    model: ILI9341                 # if the screen stays white try st7789v:
+    spi_id: lcd_bus                # some "2USB" revisions ship that controller
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    invert_colors: false
+    auto_clear_enabled: false      # LVGL owns the framebuffer, and for the same
+                                   # reason `rotation` goes in the lvgl block
+    update_interval: never
+
+touchscreen:
+  - platform: xpt2046
+    id: touch
+    spi_id: touch_bus
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    # No update_interval: interrupt_pin drives the reads, and setting both makes
+    # the component log "Touch Polling Stopped".
+    threshold: 400
+    # MEASURED on this unit by tapping the four corners, not the generic
+    # 2432S028R figures - those claimed x 280..3860 / y 340..3860, but the panel
+    # really produces x 523..3487 / y 507..3613, so the right ~28% of the screen
+    # could not be touched at all. Corner taps now land within a few px of the
+    # true corners. Re-measure with `logger: level: DEBUG` (xpt2046 prints the
+    # raw pairs) if the panel is ever replaced.
+    calibration:
+      x_min: 500
+      x_max: 3560
+      y_min: 490
+      y_max: 3630
+    # NO swap_xy here on purpose: LVGL already rotates touch input itself in
+    # LvglComponent::rotate_coordinates(), driven by `rotation: 90` in lvgl:.
+    # Adding swap_xy rotates a second time and every tap lands on the left
+    # button. mirror_x IS needed: measured on the unit, a gear tap gave
+    # raw=(595,2730) -> lvgl=(217,218), i.e. the bottom of the screen. LVGL
+    # computes y as (240 - tp.x - 1), so this axis has to be inverted.
+    transform:
+      mirror_x: true
+    on_touch:
+      - lambda: 'id(is_idle) = false;'
+      - script.execute: apply_backlight
+
+# ---------------------------------------------------------------- sensors
+
+sensor:
+  - platform: scd4x            # covers SCD40 and SCD41; this one is an SCD41
+    id: scd
+    update_interval: 30s
+    # low_power_periodic: one measurement every 30 s instead of every 5. It is
+    # an SCD41 mode and it pays off twice: a living-room display does not need a
+    # faster refresh, and the sensor self-heats less, so the temperature is less
+    # skewed. Must stay <= update_interval.
+    measurement_mode: low_power_periodic
+    # Temperature and humidity come from the SCD41: there is no SHT40 on this
+    # node. The SCD4x SUBTRACTS this offset from its raw reading, and it also
+    # uses it to compute the reported humidity - so one wrong number here
+    # corrupts both values.
+    #
+    # Tuned on the bench 2026-08-26 against a reference thermometer, with the
+    # device settled at idle brightness: reported 23.05 degC / 72.3 %RH against
+    # a true 28.5 degC / 54 %RH, so raw = 23.05 + 6.0 = 29.05 and the real
+    # self-heating is only 0.55 degC, not the 6.0 that was guessed here. The
+    # humidity error was the same error: that air at 28.5 degC is 52 %RH.
+    #
+    # Re-tune if the sensor is moved or the idle brightness changes a lot.
+    #
+    # 2026-10-18: in the printed V2 case at 100 % brightness it read 25.7 degC /
+    # 57 %RH against a reference 22.7 degC / 66 %RH: 3.0 degC more self-heating
+    # (closed case, brighter screen), so 0.6 + 3.0. Both errors were this one.
+    # Then with the screen off at night it read 22.05 vs 22.9: the backlight
+    # alone is worth 0.85 degC. So this is the SCREEN-OFF offset (3.6 - 0.85),
+    # and the temperature filter below takes off up to bl_heat_c more while the
+    # backlight is on (and fixes humidity to match).
+    temperature_offset: 2.75 °C
+    altitude_compensation: ${altitude}
+    # ASC assumes the room drops back to ~400 ppm at least once a week. Lived-in rooms rarely do (a
+    # bedroom aired a little in the morning stays well above 420 in winter), so ASC would take that
+    # minimum as 400 and read low. OFF: calibrate outdoors instead (CALIBRATION page or the HA button), every
+    # 6-12 months; the result is saved in the SCD41 (persist_settings in co2_cal).
+    automatic_self_calibration: false
+    # HA derives the entity ids from the device name. If you need them to match
+    # a naming convention of your own, rename them once in HA under
+    # Settings > Entities > (entity) > Entity ID.
+    co2:
+      id: co2
+      name: CO2
+      filters:
+        - lambda: 'return x + id(co2_offset).state;'
+      on_value:
+        - script.execute: refresh
+    temperature:
+      id: temp
+      name: Temperature
+      filters:
+        # fine trim on top of the sensor's own temperature_offset, adjustable
+        # from HA or the calibration screen. Takes effect on the next reading.
+        # Backlight self-heating: follows the brightness with a ~10 min thermal
+        # lag (one step per 30 s reading). ponytail: linear in brightness, from
+        # one point at 100 %; re-measure at 50 % if the screen is kept dimmer.
+        - lambda: |-
+            float b = id(backlight).current_values.is_on() ? id(backlight).current_values.get_brightness() : 0.0f;
+            id(bl_heat) += (b - id(bl_heat)) * 0.05f;
+            id(raw_temp) = x;
+            id(heat_dt) = ${bl_heat_c} * id(bl_heat);
+            return x - id(heat_dt) + id(temp_offset).state;
+      on_value:
+        - script.execute: refresh
+    humidity:
+      id: hum
+      name: Humidity
+      filters:
+        # the same air at the corrected (lower) temperature has a higher RH
+        - lambda: |-
+            auto es = [](float t) { return 6.112f * expf(17.62f * t / (243.12f + t)); };
+            float t = id(raw_temp);
+            if (std::isnan(t)) return x + id(hum_offset).state;
+            return std::min(100.0f, x * es(t) / es(t - id(heat_dt))) + id(hum_offset).state;
+      on_value:
+        - script.execute: refresh
+
+  # g/m3: what CapillAir compares indoors vs outdoors. HA only, not on the screen.
+  - platform: absolute_humidity
+    name: Absolute humidity
+    temperature: temp
+    humidity: hum
+
+button:
+  - platform: template
+    name: Calibrate CO2 (outdoor air, 420 ppm)
+    icon: mdi:molecule-co2
+    entity_category: config
+    on_press:
+      - script.execute: co2_cal
+
+binary_sensor:
+  # Alert conditions. Both have a dead band and must hold for 10 minutes, so a
+  # single stray reading or a value hovering on the threshold cannot spam
+  # everyone's phone. Exposed to HA too, so you can build your own automations
+  # on them instead of using the notifications below.
+  - platform: template
+    name: Room cold
+    id: cold_alert
+    lambda: |-
+      if (!id(temp).has_state() || isnan(id(temp).state))
+        return {};
+      if (id(temp).state < id(alert_temp_min).state) return true;
+      if (id(temp).state > id(alert_temp_min).state + 1.0f) return false;
+      return {};                                  // in between: keep as is
+    filters:
+      - delayed_on: 10min
+    on_press:
+      - homeassistant.action:
+          action: ${notify_action}
+          data:
+            title: !lambda 'return std::string("Room is cold");'
+            message: !lambda |-
+              return std::string("Turn the heating on");
+
+  - platform: template
+    name: Stale air
+    id: co2_alert
+    lambda: |-
+      if (!id(co2).has_state() || isnan(id(co2).state))
+        return {};
+      if (id(co2).state > id(alert_co2_max).state) return true;
+      if (id(co2).state < id(alert_co2_max).state - 100.0f) return false;
+      return {};
+    filters:
+      - delayed_on: 10min
+    on_press:
+      - homeassistant.action:
+          action: ${notify_action}
+          data:
+            title: !lambda 'return std::string("Stale air");'
+            message: !lambda |-
+              return std::string("Open the windows");
+
+  - platform: template
+    name: High humidity
+    id: hum_alert
+    lambda: |-
+      if (!id(hum).has_state() || isnan(id(hum).state))
+        return {};
+      if (id(hum).state > id(alert_hum_max).state) return true;
+      if (id(hum).state < id(alert_hum_max).state - 5.0f) return false;
+      return {};
+    filters:
+      - delayed_on: 10min
+    on_press:
+      - homeassistant.action:
+          action: ${notify_action}
+          data:
+            title: !lambda 'return std::string("High humidity");'
+            message: !lambda |-
+              return std::string("Air the room out");
+
+  - platform: status
+    id: ha_link
+    name: HA connection
+    on_state:
+      - script.execute: refresh
+
+# State of the two driven entities. When an entity does not exist the text
+# sensor stays empty - that is what draws the button as "n/a".
+text_sensor:
+  - platform: homeassistant
+    id: heat_state
+    entity_id: ${heat_entity}
+    on_value:
+      - script.execute: refresh
+  - platform: homeassistant
+    id: cool_state
+    entity_id: ${cool_entity}
+    on_value:
+      - script.execute: refresh
+
+# Every setting below is a real HA entity, so it can be changed from the phone
+# or the browser as well as from the touchscreen. optimistic + restore_value
+# means the device owns the value and keeps it across reboots.
+number:
+  - platform: template
+    name: Temperature offset
+    id: temp_offset
+    unit_of_measurement: "°C"
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+  - platform: template
+    name: Humidity offset
+    id: hum_offset
+    unit_of_measurement: "%"
+    min_value: -20
+    max_value: 20
+    step: 0.5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+  - platform: template
+    name: CO2 offset
+    id: co2_offset
+    unit_of_measurement: ppm
+    min_value: -200
+    max_value: 200
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+
+  # Alert thresholds. Editable here, on the ALERTS screen, or from HA.
+  - platform: template
+    name: Alert temperature below
+    id: alert_temp_min
+    unit_of_measurement: "°C"
+    min_value: 5
+    max_value: 25
+    step: 0.5
+    initial_value: 17
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+  - platform: template
+    name: Alert humidity above
+    id: alert_hum_max
+    unit_of_measurement: "%"
+    min_value: 40
+    max_value: 90
+    step: 1
+    initial_value: 65
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+  - platform: template
+    name: Alert CO2 above
+    id: alert_co2_max
+    unit_of_measurement: ppm
+    min_value: 600
+    max_value: 3000
+    step: 50
+    initial_value: 1000
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: refresh
+
+  # No LDR on this board, so the screen cannot read the room: the level it sits
+  # at when nobody is touching it is simply what this says. The night window
+  # still overrides it inside its hours.
+  - platform: template
+    name: Screen brightness
+    id: idle_bright
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 10
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    icon: mdi:brightness-6
+    on_value:
+      - script.execute: apply_backlight
+      - script.execute: refresh
+
+select:
+  - platform: template
+    name: Skin
+    id: skin_select
+    # Option order must match CYD_SKINS in helpers.h.
+    options: ["Contrast", "Night", "Day", "Colour", "Warm night", "NoPattern"]
+    initial_option: Contrast
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    icon: mdi:palette
+    on_value:
+      - lambda: |-
+          const char *n[] = {"Contrast", "Night", "Day", "Colour", "Warm night", "NoPattern"};
+          for (int i = 0; i < 6; i++) if (x == n[i]) { id(skin) = i; break; }
+      - script.execute: apply_skin
+  - platform: template
+    name: Night screen
+    id: night_mode
+    options: ["Off", "Dim", "Always on"]
+    initial_option: Dim
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: apply_backlight
+      - script.execute: refresh
+
+switch:
+  - platform: template
+    name: Alternate clock
+    id: clock_alt
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    icon: mdi:clock-outline
+  # 180-degree flip. LVGL puts touch input through the same rotation_ value
+  # (LvglComponent::rotate_coordinates), so taps follow the picture and no
+  # recalibration is needed. set_rotation() is guarded by is_ready(), so the
+  # restore at boot just stores the angle and LVGL starts up already flipped.
+  - platform: template
+    name: Screen upside down
+    id: flip_screen
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    icon: mdi:screen-rotation
+    turn_on_action:
+      - lvgl.display.set_rotation: 270
+      - script.execute: refresh
+    turn_off_action:
+      - lvgl.display.set_rotation: 90
+      - script.execute: refresh
+
+datetime:
+  - platform: template
+    name: Night from
+    id: night_from
+    type: time
+    initial_value: "00:00:00"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: apply_backlight
+      - script.execute: refresh
+  - platform: template
+    name: Night to
+    id: night_to
+    type: time
+    initial_value: "07:00:00"
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    on_value:
+      - script.execute: apply_backlight
+      - script.execute: refresh
+
+# re-evaluate the night window even while nobody touches the screen
+interval:
+  - interval: 60s
+    then:
+      - script.execute: apply_backlight
+  # values <-> clock. Only from the main page and only 10 s after the last touch,
+  # so it never flips away while someone is reading or pressing a button.
+  - interval: 1s
+    then:
+      - lambda: 'id(page_s)++;'
+      - if:
+          condition:
+            lambda: |-
+              return id(clock_alt).state && id(main_page)->is_showing() &&
+                     id(page_s) >= ${data_s} && lv_display_get_inactive_time(nullptr) > 10000;
+          then:
+            - lambda: 'id(page_s) = 0;'
+            - lvgl.page.show: clock_page
+      - if:
+          condition:
+            lambda: |-
+              return id(clock_page)->is_showing() &&
+                     (id(page_s) >= ${clock_s} || !id(clock_alt).state);
+          then:
+            - lambda: 'id(page_s) = 0;'
+            - lvgl.page.show: main_page
+
+globals:
+  # backlight self-heating model (see the SCD41 temperature filter)
+  - id: bl_heat
+    type: float
+    initial_value: '1.0'
+  - id: raw_temp
+    type: float
+    initial_value: 'NAN'
+  - id: heat_dt
+    type: float
+    initial_value: '0'
+  # tracked so apply_backlight knows whether the screen is idle or in use
+  - id: is_idle
+    type: bool
+    initial_value: 'false'
+  # seconds on the current page of the values/clock rotation
+  - id: page_s
+    type: int
+    initial_value: '0'
+  # index into CYD_SKINS in helpers.h. The select below is the source of truth;
+  # this mirrors it so the lambdas do not have to parse a string every redraw.
+  - id: skin
+    type: int
+    initial_value: '0'
+    restore_value: true
+
+# ---------------------------------------------------------------- icons
+
+image:
+  # ESPHome downloads the icon from the Material Design set itself, so there is
+  # no font codepoint to guess. BINARY = 1 bit, which LVGL can recolour.
+  # If a solid box shows behind it, switch to TRANSPARENT_BINARY.
+  - file: mdi:home-assistant
+    id: img_ha
+    resize: 26x26
+    type: BINARY
+  - file: mdi:cog
+    id: img_cog
+    resize: 26x26
+    type: BINARY
+  - file: mdi:arrow-left
+    id: img_back
+    resize: 26x26
+    type: BINARY
+
+# ---------------------------------------------------------------- fonts
+
+font:
+  # Reduced glyph sets on the big sizes: a full face at 58 px eats flash.
+  - file: gfonts://Roboto+Condensed@700
+    id: f_huge
+    size: 62
+    glyphs: "0123456789.-"
+  - file: gfonts://Roboto+Condensed@700
+    id: f_mid
+    size: 42
+    glyphs: "0123456789.-%"
+  - file: gfonts://Roboto+Condensed@700
+    id: f_btn
+    size: 25
+  - file: gfonts://Roboto+Condensed@700
+    id: f_state
+    size: 21
+  - file: gfonts://Roboto+Condensed@700
+    id: f_air              # smaller: "APRI FINESTRA" at 21 px ran off the screen
+    size: 19
+  - file: gfonts://Roboto+Condensed@700
+    id: f_unit             # °C next to the big temperature. 20, not 22: at 22
+    size: 20               # a reading like -10.5 overflowed the 156 px column
+    glyphs: "°C"
+  - file: gfonts://Roboto+Condensed@700
+    id: f_unit_s           # CO2/ppm stack and the RH next to the humidity
+    size: 16
+  - file: gfonts://Roboto+Condensed@400
+    id: f_label
+    size: 15
+  - file: gfonts://Roboto+Condensed@700
+    id: f_clock            # full-screen clock: "23:59" at 130 px is ~290 of the 320 px
+    size: 130
+    glyphs: "0123456789:-"
+
+# ---------------------------------------------------------------- screen
+
+lvgl:
+  displays: [lcd]
+  rotation: 90                     # landscape, 320x240
+  on_boot:
+    - script.execute: apply_skin      # ends by calling refresh
+  touchscreens:
+    - touchscreen_id: touch
+      # 800 ms, not the 400 ms default: at 400 a long press is barely longer
+      # than a tap, which defeats the point of asking for confirmation.
+      long_press_time: 800ms
+  buffer_size: 25%                 # no PSRAM, so this cannot go much higher
+  bg_color: 0x0E1116
+  text_color: 0xF2F4F7
+  # on_short_click fires only when the press was NOT long, so the hint and the
+  # action can never both run. long_press_time lives under touchscreens above.
+  on_idle:
+    timeout: 120s                  # a touch at night lights it for 2 min
+    then:
+      - lambda: 'id(is_idle) = true;'
+      - script.execute: apply_backlight
+  pages:
+    # Two centrelines, taken from the centres of the two buttons: x=82 and
+    # x=238 (button 8..156 and 164..312). Every row is a 156-wide box placed so
+    # its centre lands on one of them, with the content centred inside - so the
+    # layout does not shift when a value goes from 3 digits to 4.
+    - id: main_page
+      # skins with a glow: top colour fading into the background by mid-screen
+      bg_grad_dir: VER
+      bg_main_stop: 0
+      bg_grad_stop: 190
+      widgets:
+        # value cards, drawn first so they sit behind everything (apply_skin colours them)
+        - obj:
+            id: card_l
+            bg_opa: 55%           # glass, like the HA cards: the page glow shows through
+            x: 4
+            y: 30
+            width: 154
+            height: 128
+            radius: 16
+            border_width: 1
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            scrollable: false
+            clickable: false
+        - obj:
+            id: card_r
+            bg_opa: 55%           # glass, like the HA cards: the page glow shows through
+            x: 162
+            y: 30
+            width: 154
+            height: 128
+            radius: 16
+            border_width: 1
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            scrollable: false
+            clickable: false
+        # ---- top: the two icons, one per centreline
+        - image:
+            id: ico_ha              # grey = disconnected, light blue = HA connected
+            src: img_ha
+            x: 69                   # 82 - 26/2
+            y: 2
+            image_recolor: 0x8B98A5
+            image_recolor_opa: COVER
+        # The clock, centred on the screen (160) between the two icons. f_state
+        # is 21px -> 25px tall, so it fits the 30px the icons leave above y=32.
+        - label:
+            id: lbl_clock
+            text: "--:--"
+            text_font: f_state
+            x: 130                  # 160 - 60/2
+            y: 3
+            width: 60
+            text_align: CENTER
+            long_mode: CLIP
+        # The gear is drawn 26px wide but sits near the edge, where calibration
+        # error is worst. The hit area is a transparent 60x38 box on the same
+        # centreline; the icon just rides inside it, so nothing moves visually.
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            id: hit_cog             # tap opens the settings page
+            x: 208                  # 238 - 60/2
+            y: 0
+            width: 60
+            height: 30
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.page.show: settings_page
+            widgets:
+              - image:
+                  id: ico_cog
+                  align: CENTER
+                  src: img_cog
+                  image_recolor: 0x8B98A5
+                  image_recolor_opa: COVER
+
+        # ---- big row. A flex row centres the number and its unit as a GROUP,
+        #      which a fixed x could not do once the digit count changes.
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 4
+            y: 32
+            width: 156
+            height: 73
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: flex
+              flex_flow: ROW
+              flex_align_main: CENTER
+              flex_align_cross: END
+              pad_column: 2
+            widgets:
+              - label:
+                  id: lbl_temp
+                  text: "--.-"
+                  text_font: f_huge
+                  # Explicit, not inherited. These two values were the only
+                  # labels on the page without their own text_color, and on the
+                  # panel they came out dark: the top-level `text_color` does
+                  # not reach them. Pure white, the brightest thing on screen.
+                  text_color: 0xFFFFFF
+              - label:
+                  id: lbl_u_c
+                  text: "°C"
+                  text_font: f_unit
+                  pad_bottom: 11      # sit on the digits' baseline, not below it
+                  text_color: 0x8B98A5
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 160
+            y: 32
+            width: 156
+            height: 92          # 73 (f_huge) + 19 (f_unit_s) - the unit sits below
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            # COLUMN, not ROW: with the unit underneath, the digits get the whole
+            # 156px column ("1000" is 124px, so it is no longer near the edge).
+            # This container may run 19px lower than the temperature one - nothing
+            # is beside it there, lbl_air starts at y=128.
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              flex_align_main: CENTER
+              flex_align_cross: CENTER
+              flex_align_track: CENTER   # one track as wide as the number: centre it too, or it hugs the left edge
+              pad_row: 0
+            widgets:
+              - label:
+                  id: lbl_co2
+                  text: "----"
+                  text_font: f_huge
+                  text_color: 0x8B98A5
+              - label:
+                  id: lbl_u_co2
+                  text: CO2 ppm
+                  text_font: f_unit_s
+                  text_align: CENTER
+                  text_color: 0x8B98A5
+
+        # ---- second row
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 4
+            y: 107
+            width: 156
+            height: 49
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: flex
+              flex_flow: ROW
+              flex_align_main: CENTER
+              flex_align_cross: END
+              pad_column: 2
+            widgets:
+              - label:
+                  id: lbl_hum
+                  text: "--"
+                  text_font: f_mid
+                  text_color: 0xFFFFFF     # see lbl_temp
+              - label:
+                  id: lbl_u_hr
+                  text: RH
+                  text_font: f_unit_s
+                  pad_bottom: 6       # baseline-align with the humidity digits
+                  text_color: 0x8B98A5
+        - label:
+            id: lbl_air
+            x: 160
+            y: 128
+            width: 156
+            text: ""
+            text_font: f_air
+            text_align: CENTER
+            long_mode: CLIP     # better clipped than wrapped over the buttons
+            text_color: 0x8B98A5
+
+        # ---- HEAT button: HOLD to toggle. A stray tap on a resistive screen
+        #      must not switch a heater.
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_heat
+            x: 8
+            y: 160
+            width: 148
+            height: 72
+            radius: 12
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_long_press:
+              - if:
+                  condition:
+                    lambda: 'return id(heat_state).has_state() && !id(heat_state).state.empty();'
+                  then:
+                    - homeassistant.action:
+                        action: homeassistant.toggle
+                        data:
+                          entity_id: ${heat_entity}
+            on_short_click:
+              - script.execute:
+                  id: hint
+                  target: 0
+            widgets:
+              - obj:              # luminous bar of a lit tile (Warm night)
+                  id: bar_heat
+                  align: LEFT_MID
+                  x: 6
+                  width: 4
+                  height: 40
+                  radius: 2
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  clickable: false
+              - label:
+                  id: lbl_ttl_heat
+                  align: TOP_MID
+                  y: 3
+                  text: HEAT
+                  text_font: f_btn
+              - label:
+                  id: lbl_heat
+                  align: BOTTOM_MID
+                  y: -3
+                  width: 144          # = button 148 - 2x2 border
+                  text_align: CENTER
+                  long_mode: DOT      # ellipsis beats clipping both ends
+                  text: "--"
+                  text_font: f_state
+                  text_color: 0x8B98A5
+
+        # ---- COOL button: same, inert while its entity does not exist
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_cool
+            x: 164
+            y: 160
+            width: 148
+            height: 72
+            radius: 12
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_long_press:
+              - if:
+                  condition:
+                    lambda: 'return id(cool_state).has_state() && !id(cool_state).state.empty();'
+                  then:
+                    - homeassistant.action:
+                        action: homeassistant.toggle
+                        data:
+                          entity_id: ${cool_entity}
+            on_short_click:
+              - script.execute:
+                  id: hint
+                  target: 1
+            widgets:
+              - obj:              # luminous bar of a lit tile (Warm night)
+                  id: bar_cool
+                  align: LEFT_MID
+                  x: 6
+                  width: 4
+                  height: 40
+                  radius: 2
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  clickable: false
+              - label:
+                  id: lbl_ttl_cool
+                  align: TOP_MID
+                  y: 3
+                  text: COOL
+                  text_font: f_btn
+              - label:
+                  id: lbl_cool
+                  align: BOTTOM_MID
+                  y: -3
+                  width: 144
+                  text_align: CENTER
+                  long_mode: DOT
+                  text: n/a
+                  text_font: f_state
+                  text_color: 0x8B98A5
+
+    # ---------------------------------------------------------------- clock
+    # Shown in turn with main_page (interval below). Same background as the
+    # values in the chosen skin (apply_skin). A touch goes back to the values.
+    - id: clock_page
+      bg_grad_dir: VER
+      bg_main_stop: 0
+      bg_grad_stop: 190
+      widgets:
+        - label:
+            id: lbl_big_clock
+            text: "--:--"
+            text_font: f_clock
+            align: CENTER
+            y: -14
+        - label:
+            id: lbl_date
+            text: ""
+            text_font: f_state
+            align: CENTER
+            y: 66
+        - obj:                    # transparent full-screen hit area
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+            bg_opa: TRANSP
+            border_width: 0
+            on_press:
+              - lambda: 'id(page_s) = 0;'
+              - lvgl.page.show: main_page
+
+    # ---------------------------------------------------------------- settings
+    # WiFi credentials really are settable at runtime: wifi.configure with
+    # save: true writes them to flash. The device uses DHCP, so it can move to
+    # another network from this page without any further edits.
+    - id: settings_page
+      widgets:
+        - label:
+            id: lbl_set_title
+            x: 10
+            y: 2
+            text: SETTINGS
+            text_font: f_state
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 258
+            y: 0
+            width: 62
+            height: 40
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.widget.hide: kb_ssid
+              - lvgl.widget.hide: kb_pass
+              - lvgl.widget.hide: dd_ssid
+              - lvgl.page.show: main_page
+            widgets:
+              - image:
+                  id: ico_back
+                  src: img_back
+                  align: CENTER
+                  image_recolor: 0x8B98A5
+                  image_recolor_opa: COVER
+
+        - label:
+            x: 8
+            y: 48
+            text: SSID
+            text_font: f_label
+            text_color: 0x8B98A5
+        - textarea:
+            id: ta_ssid
+            x: 84
+            y: 42
+            width: 228
+            height: 30          # f_label is 18px tall + 4px pad + 2px border each side
+            pad_top: 4
+            pad_bottom: 4
+            pad_left: 8
+            pad_right: 8
+            one_line: true
+            max_length: 32
+            text_font: f_label
+            placeholder_text: wifi network
+            on_focus:
+              - lvgl.widget.hide: kb_pass
+              - lvgl.widget.hide: kb_ssid
+              - script.execute: ssid_scan
+
+        # The scan list, sitting exactly on top of the SSID field. Hidden until
+        # you tap that field; picking an entry writes it into the field. The
+        # last entry is always "type it by hand", which is the only way in for a
+        # hidden network - hence the index check in on_value.
+        - dropdown:
+            id: dd_ssid
+            hidden: true
+            x: 84
+            y: 42
+            width: 228
+            height: 30          # same box as the textarea it covers
+            pad_all: 0
+            pad_top: 4
+            pad_bottom: 4
+            pad_left: 8
+            pad_right: 8
+            text_font: f_label
+            text_color: 0xF2F4F7
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            options: ["..."]
+            dropdown_list:
+              bg_color: 0x1B2028
+              text_color: 0xF2F4F7
+              border_color: 0x2E3846
+              border_width: 2
+              text_font: f_label
+              selected:
+                bg_color: 0x38BDF8
+                text_color: 0x0E1116
+            on_value:
+              - lvgl.widget.hide: dd_ssid
+              - if:
+                  condition:
+                    lambda: |-
+                      return id(dd_ssid)->get_selected_index() + 1 ==
+                             id(dd_ssid)->get_options().size();
+                  then:
+                    - lvgl.widget.show: kb_ssid
+                  else:
+                    - lambda: |-
+                        lv_textarea_set_text(id(ta_ssid),
+                            id(dd_ssid)->get_options()[id(dd_ssid)->get_selected_index()]);
+
+        - label:
+            id: lbl_cap_pass
+            x: 8
+            y: 84
+            text: PASSWORD
+            text_font: f_label
+            text_color: 0x8B98A5
+        - textarea:
+            id: ta_pass
+            x: 84
+            y: 78
+            width: 228
+            height: 30          # f_label is 18px tall + 4px pad + 2px border each side
+            pad_top: 4
+            pad_bottom: 4
+            pad_left: 8
+            pad_right: 8
+            one_line: true
+            password_mode: true
+            max_length: 63
+            text_font: f_label
+            on_focus:
+              - lvgl.widget.hide: kb_ssid
+              - lvgl.widget.hide: dd_ssid
+              - lvgl.widget.show: kb_pass
+
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_save
+            x: 176
+            y: 124
+            width: 136
+            height: 36
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.widget.hide: kb_ssid
+              - lvgl.widget.hide: kb_pass
+              - lvgl.widget.hide: dd_ssid
+              - lvgl.label.update:
+                  id: lbl_status
+                  text: !lambda 'return std::string("connecting...");'
+                  text_color: 0x8B98A5
+              - wifi.configure:
+                  ssid: !lambda 'return std::string(lv_textarea_get_text(id(ta_ssid)));'
+                  password: !lambda 'return std::string(lv_textarea_get_text(id(ta_pass)));'
+                  save: true
+                  timeout: 20s
+                  on_connect:
+                    - lvgl.label.update:
+                        id: lbl_status
+                        text: !lambda 'return std::string("saved, connected");'
+                        text_color: 0x4ADE80
+                  on_error:
+                    - lvgl.label.update:
+                        id: lbl_status
+                        text: !lambda 'return std::string("connection failed");'
+                        text_color: 0xF87171
+            widgets:
+              - label:
+                  id: lbl_save
+                  align: CENTER
+                  text: SAVE
+                  text_font: f_state
+
+        - label:
+            id: lbl_status
+            x: 8
+            y: 166
+            width: 304
+            text: ""
+            text_font: f_label
+            long_mode: CLIP
+            text_color: 0x8B98A5
+
+        # Declared last so they draw on top of everything else. One keyboard
+        # per textarea: the widget binds to its textarea at config time.
+
+        # ---- tab bar, same on every settings page
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 4
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: settings_page
+            widgets:
+              - label:
+                  align: CENTER
+                  text: WIFI
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 82
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: cal_page
+            widgets:
+              - label:
+                  id: lbl_tab_cal_1
+                  align: CENTER
+                  text: CALIB.
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 160
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: night_page
+            widgets:
+              - label:
+                  id: lbl_tab_night_1
+                  align: CENTER
+                  text: SCREEN
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 238
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: alert_page
+            widgets:
+              - label:
+                  id: lbl_tab_alert_1
+                  align: CENTER
+                  text: ALERTS
+                  text_font: f_label
+        - keyboard:
+            id: kb_ssid
+            textarea: ta_ssid
+            # lv_keyboard_create() aligns itself BOTTOM_MID, and in LVGL 9 x/y are
+            # OFFSETS from the align point, not absolute coords - so the old
+            # "y: 112" pushed the keyboard 112px BELOW the screen. Align stays
+            # bottom, offsets are zero, and the 128px height puts it at y=112.
+            align: BOTTOM_MID
+            x: 0
+            y: 0
+            width: 320
+            height: 128
+            hidden: true
+            on_ready:
+              - lvgl.widget.hide: kb_ssid
+        - keyboard:
+            id: kb_pass
+            textarea: ta_pass
+            # lv_keyboard_create() aligns itself BOTTOM_MID, and in LVGL 9 x/y are
+            # OFFSETS from the align point, not absolute coords - so the old
+            # "y: 112" pushed the keyboard 112px BELOW the screen. Align stays
+            # bottom, offsets are zero, and the 128px height puts it at y=112.
+            align: BOTTOM_MID
+            x: 0
+            y: 0
+            width: 320
+            height: 128
+            hidden: true
+            on_ready:
+              - lvgl.widget.hide: kb_pass
+
+    # ---------------------------------------------------------------- offsets
+    # Calibration trims. The same three values are HA `number` entities, so
+    # they can be nudged here or set exactly from the phone - both write the
+    # same entity. They land on the next sensor reading, so up to 30 s later.
+    - id: cal_page
+      widgets:
+        - label:
+            id: lbl_cal_title
+            x: 10
+            y: 2
+            text: CALIBRATION
+            text_font: f_state
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 258
+            y: 0
+            width: 62
+            height: 40
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.page.show: main_page
+            widgets:
+              - image:
+                  src: img_back
+                  align: CENTER
+                  image_recolor: 0x8B98A5
+                  image_recolor_opa: COVER
+        - label:
+            id: lbl_cap_ot
+            x: 8
+            y: 45
+            text: TEMP
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 36
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: temp_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_temp_offset
+            x: 114
+            y: 42
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 36
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: temp_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 45
+            text: "°C"
+            text_font: f_label
+            text_color: 0x8B98A5
+        - label:
+            id: lbl_cap_oh
+            x: 8
+            y: 85
+            text: RH
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 76
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: hum_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_hum_offset
+            x: 114
+            y: 82
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 76
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: hum_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 85
+            text: "%"
+            text_font: f_label
+            text_color: 0x8B98A5
+        - label:
+            id: lbl_cap_oc
+            x: 8
+            y: 125
+            text: CO2
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 116
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: co2_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_co2_offset
+            x: 114
+            y: 122
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 116
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: co2_offset
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 125
+            text: "ppm"
+            text_font: f_label
+            text_color: 0x8B98A5
+        # CO2 forced calibration: the sensor must sit in outdoor air (~420 ppm)
+        # for 5 minutes first. HOLD, so a stray tap cannot shift the zero point.
+        - button:
+            pad_all: 0
+            id: btn_co2_cal
+            x: 8
+            y: 156
+            width: 304
+            height: 36
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_long_press:
+              - script.execute: co2_cal
+            widgets:
+              - label:
+                  id: lbl_co2_cal
+                  align: CENTER
+                  text: "HOLD: CO2 = 420 OUTDOORS"
+                  text_font: f_label
+
+        # ---- tab bar, same on every settings page
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 4
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: settings_page
+            widgets:
+              - label:
+                  align: CENTER
+                  text: WIFI
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 82
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: cal_page
+            widgets:
+              - label:
+                  id: lbl_tab_cal_2
+                  align: CENTER
+                  text: CALIB.
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 160
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: night_page
+            widgets:
+              - label:
+                  id: lbl_tab_night_2
+                  align: CENTER
+                  text: SCREEN
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 238
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: alert_page
+            widgets:
+              - label:
+                  id: lbl_tab_alert_2
+                  align: CENTER
+                  text: ALERTS
+                  text_font: f_label
+    # ---------------------------------------------------------------- screen
+    # Night window. Outside it the screen dims on idle as usual; inside it the
+    # chosen mode wins. A touch always brings it back to full for 90 s.
+    - id: night_page
+      widgets:
+        - label:
+            id: lbl_night_title
+            x: 10
+            y: 2
+            text: SCREEN
+            text_font: f_state
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 258
+            y: 0
+            width: 62
+            height: 40
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.page.show: main_page
+            widgets:
+              - image:
+                  src: img_back
+                  align: CENTER
+                  image_recolor: 0x8B98A5
+                  image_recolor_opa: COVER
+        - label:
+            id: lbl_cap_mode
+            x: 8
+            y: 35
+            text: AT NIGHT
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_night_mode
+            x: 110
+            y: 30
+            width: 148
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - select.next:
+                  id: night_mode
+                  cycle: true
+            widgets:
+              - label:
+                  id: lbl_night_mode
+                  align: CENTER
+                  text: "--"
+                  text_font: f_state
+        # Row 2: how bright the screen sits when nobody is touching it.
+        - label:
+            id: lbl_cap_bright
+            x: 8
+            y: 63
+            text: BRIGHTNESS
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 110
+            y: 58
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: idle_bright
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_bright
+            x: 154
+            y: 60
+            width: 60
+            text: "--"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 218
+            y: 58
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: idle_bright
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            id: lbl_cap_from
+            x: 8
+            y: 91
+            text: FROM
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 110
+            y: 86
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lambda: |-
+                  int m = id(night_from).hour * 60 + id(night_from).minute - 30; m = (m % 1440 + 1440) % 1440; id(night_from).make_call().set_time(m / 60, m % 60, 0).perform();
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_night_from
+            x: 154
+            y: 88
+            width: 60
+            text: "--:--"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 218
+            y: 86
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lambda: |-
+                  int m = id(night_from).hour * 60 + id(night_from).minute + 30; m = (m % 1440 + 1440) % 1440; id(night_from).make_call().set_time(m / 60, m % 60, 0).perform();
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            id: lbl_cap_to
+            x: 8
+            y: 119
+            text: TO
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 110
+            y: 114
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lambda: |-
+                  int m = id(night_to).hour * 60 + id(night_to).minute - 30; m = (m % 1440 + 1440) % 1440; id(night_to).make_call().set_time(m / 60, m % 60, 0).perform();
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_night_to
+            x: 154
+            y: 116
+            width: 60
+            text: "--:--"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 218
+            y: 114
+            width: 40
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lambda: |-
+                  int m = id(night_to).hour * 60 + id(night_to).minute + 30; m = (m % 1440 + 1440) % 1440; id(night_to).make_call().set_time(m / 60, m % 60, 0).perform();
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+
+        - label:
+            id: lbl_cap_flip
+            x: 8
+            y: 147
+            text: ROTATION
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_flip
+            x: 110
+            y: 142
+            width: 148
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - switch.toggle: flip_screen
+            widgets:
+              - label:
+                  id: lbl_flip
+                  align: CENTER
+                  text: "--"
+                  text_font: f_state
+
+        # Row 6: the skin. Same cycle-button pattern as AT NIGHT above; the
+        # select is the source of truth, so screen and HA cannot diverge.
+        - label:
+            id: lbl_cap_skin
+            x: 8
+            y: 175
+            text: SKIN
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            id: btn_skin
+            x: 110
+            y: 170
+            width: 148
+            height: 28
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - select.next:
+                  id: skin_select
+                  cycle: true
+            widgets:
+              - label:
+                  id: lbl_skin
+                  align: CENTER
+                  text: "--"
+                  text_font: f_state
+        # ---- tab bar, same on every settings page
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 4
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: settings_page
+            widgets:
+              - label:
+                  align: CENTER
+                  text: WIFI
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 82
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: cal_page
+            widgets:
+              - label:
+                  id: lbl_tab_cal_3
+                  align: CENTER
+                  text: CALIB.
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 160
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: night_page
+            widgets:
+              - label:
+                  id: lbl_tab_night_3
+                  align: CENTER
+                  text: SCREEN
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 238
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: alert_page
+            widgets:
+              - label:
+                  id: lbl_tab_alert_3
+                  align: CENTER
+                  text: ALERTS
+                  text_font: f_label
+    # ---------------------------------------------------------------- alerts
+    # When to notify everyone in HA. Each alert has a dead band and must hold
+    # for 10 minutes, so nothing fires on a single stray reading.
+    - id: alert_page
+      widgets:
+        - label:
+            id: lbl_alert_title
+            x: 10
+            y: 2
+            text: ALERTS
+            text_font: f_state
+        - obj:
+            scrollbar_mode: "OFF"   # never show a scrollbar
+            scrollable: false       # and no stray swipe can drag content away
+            x: 258
+            y: 0
+            width: 62
+            height: 40
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - lvgl.page.show: main_page
+            widgets:
+              - image:
+                  src: img_back
+                  align: CENTER
+                  image_recolor: 0x8B98A5
+                  image_recolor_opa: COVER
+        - label:
+            id: lbl_cap_at
+            x: 8
+            y: 26
+            text: "BELOW / ABOVE"
+            text_font: f_label
+            text_color: 0x5A6673
+        - label:
+            id: lbl_cap_at_t
+            x: 8
+            y: 57
+            text: TEMP
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 48
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: alert_temp_min
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_alert_temp_min
+            x: 114
+            y: 54
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 48
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: alert_temp_min
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 57
+            text: "°C"
+            text_font: f_label
+            text_color: 0x8B98A5
+        - label:
+            id: lbl_cap_at_h
+            x: 8
+            y: 103
+            text: RH
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 94
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: alert_hum_max
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_alert_hum_max
+            x: 114
+            y: 100
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 94
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: alert_hum_max
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 103
+            text: "%"
+            text_font: f_label
+            text_color: 0x8B98A5
+        - label:
+            id: lbl_cap_at_c
+            x: 8
+            y: 149
+            text: CO2
+            text_font: f_label
+            text_color: 0x8B98A5
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 70
+            y: 140
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.decrement:
+                  id: alert_co2_max
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: f_btn
+        - label:
+            id: lbl_alert_co2_max
+            x: 114
+            y: 146
+            width: 76
+            text: "0"
+            text_font: f_state
+            text_align: CENTER
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 194
+            y: 140
+            width: 40
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - number.increment:
+                  id: alert_co2_max
+                  cycle: false
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: f_btn
+        - label:
+            x: 240
+            y: 149
+            text: "ppm"
+            text_font: f_label
+            text_color: 0x8B98A5
+
+        # ---- tab bar, same on every settings page
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 4
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: settings_page
+            widgets:
+              - label:
+                  align: CENTER
+                  text: WIFI
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 82
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: cal_page
+            widgets:
+              - label:
+                  id: lbl_tab_cal_4
+                  align: CENTER
+                  text: CALIB.
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 160
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: night_page
+            widgets:
+              - label:
+                  id: lbl_tab_night_4
+                  align: CENTER
+                  text: SCREEN
+                  text_font: f_label
+        - button:
+            pad_all: 0              # theme default is 8px vertical; we place labels ourselves
+            x: 238
+            y: 200
+            width: 76
+            height: 34
+            radius: 8
+            bg_color: 0x1B2028
+            border_color: 0x2E3846
+            border_width: 2
+            on_click:
+              - lvgl.page.show: alert_page
+            widgets:
+              - label:
+                  id: lbl_tab_alert_4
+                  align: CENTER
+                  text: ALERTS
+                  text_font: f_label
+
+# ---------------------------------------------------------------- logic
+
+script:
+  # Backlight: one place decides the brightness, because three things want a
+  # say - whether the screen is idle, whether we are inside the night window,
+  # and which night mode is selected. A touch always wins for 2 min.
+  - id: apply_backlight
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(is_idle))
+                return false;
+              auto t = id(ha_time).now();
+              if (!t.is_valid())
+                return false;              // no clock yet: behave as daytime
+              return time_in_window(t.hour * 60 + t.minute,
+                                    id(night_from).hour * 60 + id(night_from).minute,
+                                    id(night_to).hour * 60 + id(night_to).minute)
+                     && id(night_mode).current_option() == "Off";
+          then:
+            - light.turn_off: backlight
+          else:
+            - light.turn_on:
+                id: backlight
+                brightness: !lambda |-
+                  // Full brightness whenever the night window is not dimming or
+                  // switching the screen off. There is no LDR on this board to
+                  // read the room with, and a permanently dimmed living-room
+                  // display is just hard to read from the sofa.
+                  if (!id(is_idle))
+                    return 1.0f;           // in use
+                  auto t = id(ha_time).now();
+                  bool night = t.is_valid() &&
+                      time_in_window(t.hour * 60 + t.minute,
+                                     id(night_from).hour * 60 + id(night_from).minute,
+                                     id(night_to).hour * 60 + id(night_to).minute);
+                  if (night && id(night_mode).current_option() == "Dim")
+                    return 0.03f;          // just readable in the dark
+                  return id(idle_bright).state / 100.0f;
+
+  # A short tap does nothing but explain itself. Without this the device just
+  # looks broken to anyone who does not already know it wants a long press.
+  - id: hint
+    mode: restart
+    parameters:
+      target: int
+    then:
+      - if:
+          condition:
+            lambda: 'return target == 0;'
+          then:
+            - lvgl.label.update:
+                id: lbl_heat
+                text: !lambda 'return std::string("HOLD TO SET");'
+                text_font: f_air
+                text_color: 0xF2F4F7
+          else:
+            - lvgl.label.update:
+                id: lbl_cool
+                text: !lambda 'return std::string("HOLD TO SET");'
+                text_font: f_air
+                text_color: 0xF2F4F7
+      - delay: 1.5s
+      - script.execute: refresh
+
+  # An active scan takes about two seconds; 4 s of slack costs nothing and the
+  # UI keeps running through the delay. mode: restart so impatient taps do not
+  # stack up scans.
+  - id: ssid_scan
+    mode: restart
+    then:
+      - lambda: |-
+          id(dd_ssid)->set_options({"SCANNING..."});
+          wifi_scan_begin();
+      - lvgl.widget.show: dd_ssid
+      - delay: 4s
+      - lambda: |-
+          id(dd_ssid)->set_options(
+              wifi_scan_options("TYPE IT BY HAND"));
+          lv_dropdown_open(id(dd_ssid)->obj);
+
+  - id: set_clock
+    then:
+      - lvgl.label.update:
+          id: lbl_clock
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid())
+              return std::string("--:--");
+            char buf[6];
+            t.strftime(buf, sizeof(buf), "%H:%M");
+            return std::string(buf);
+      - lvgl.label.update:
+          id: lbl_big_clock
+          text: !lambda 'return std::string(lv_label_get_text(id(lbl_clock)));'
+      - lvgl.label.update:
+          id: lbl_date
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid())
+              return std::string("");
+            static const char *d_en[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
+            static const char *m_en[] = {"JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+                                         "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"};
+            return str_sprintf("%s, %s %d", d_en[t.day_of_week - 1], m_en[t.month - 1], t.day_of_month);
+
+  # Repaint the main page from the chosen palette, then let refresh() redo the
+  # value-dependent colours (CO2 and the air message) with the same palette.
+  # Only the main page is themed: the settings pages keep one dark chrome so the
+  # controls do not change appearance while you are operating them.
+  # Forced recalibration to 420 ppm (outdoor air). Clears the manual CO2 trim:
+  # after this the sensor itself is right.
+  - id: co2_cal
+    mode: single
+    then:
+      - scd4x.perform_forced_calibration:
+          id: scd
+          value: 420
+      # ESPHome only sets the FRC in the sensor's RAM: a power cut loses it (seen 2026-10-29: 409 -> 462 ppm
+      # outdoors after a replug). persist_settings (0x3615) writes it to the SCD41's EEPROM; it needs
+      # periodic measurement stopped, so: stop, persist, restart in low-power periodic (the mode set above).
+      - lambda: 'static const uint8_t c[2] = {0x3f, 0x86}; id(cn1_bus)->write(0x62, c, 2);'  # stop
+      - delay: 600ms
+      - lambda: 'static const uint8_t c[2] = {0x36, 0x15}; id(cn1_bus)->write(0x62, c, 2);'  # persist
+      - delay: 900ms
+      - lambda: 'static const uint8_t c[2] = {0x21, 0xac}; id(cn1_bus)->write(0x62, c, 2);'  # low-power periodic
+      - number.set:
+          id: co2_offset
+          value: 0
+      - lvgl.label.update:
+          id: lbl_co2_cal
+          text: !lambda 'return std::string("CO2 SET TO 420");'
+      - delay: 4s
+      - script.execute: refresh
+
+  - id: apply_skin
+    mode: restart
+    then:
+      - lvgl.widget.update:
+          id: main_page
+          bg_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).top);'
+          bg_grad_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).bg);'
+      - lvgl.widget.update:
+          id: clock_page
+          bg_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).top);'
+          bg_grad_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).bg);'
+      - lvgl.label.update:
+          id: lbl_big_clock
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).temp);'
+      - lvgl.label.update:
+          id: lbl_date
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).dim);'
+      - lvgl.widget.update:
+          id: [card_l, card_r]
+          bg_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).card);'
+          border_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).card_line);'
+      - lvgl.label.update:
+          id: lbl_temp
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).temp);'
+      - lvgl.label.update:
+          id: lbl_hum
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).hum);'
+      - lvgl.label.update:
+          id: lbl_clock
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).fg);'
+      - lvgl.label.update:
+          id: lbl_u_c
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).dim);'
+      - lvgl.label.update:
+          id: lbl_u_hr
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).dim);'
+      - lvgl.label.update:
+          id: lbl_u_co2
+          text_color: !lambda 'return lv_color_hex(cyd_skin(id(skin)).dim);'
+      - script.execute: refresh
+
+  - id: refresh
+    mode: restart
+    then:
+      - script.execute: set_clock
+      - lvgl.label.update:
+          id: lbl_temp
+          text: !lambda |-
+            if (!id(temp).has_state()) return std::string("--.-");
+            return str_sprintf("%.1f", id(temp).state);
+      - lvgl.label.update:
+          id: lbl_hum
+          text: !lambda |-
+            if (!id(hum).has_state()) return std::string("--");
+            return str_sprintf("%.0f%%", id(hum).state);
+
+      # CO2: the number and the word below it change colour together.
+      - lvgl.label.update:
+          id: lbl_co2
+          text: !lambda |-
+            if (!id(co2).has_state()) return std::string("----");
+            return str_sprintf("%.0f", id(co2).state);
+          text_color: !lambda |-
+            const CydSkin &s = cyd_skin(id(skin));
+            if (!id(co2).has_state()) return lv_color_hex(s.dim);
+            if (id(co2).state < ${co2_good})  return lv_color_hex(s.co2_good);
+            if (id(co2).state < ${co2_bad}) return lv_color_hex(s.co2_warn);
+            return lv_color_hex(s.co2_bad);
+      - lvgl.label.update:
+          id: lbl_air
+          text: !lambda |-
+            if (!id(co2).has_state()) return std::string("");
+            if (id(co2).state < ${co2_good})  return std::string("AIR GOOD");
+            if (id(co2).state < ${co2_bad}) return std::string("AIR STALE");
+            return std::string("OPEN WINDOW");
+          text_color: !lambda |-
+            const CydSkin &s = cyd_skin(id(skin));
+            if (!id(co2).has_state()) return lv_color_hex(s.dim);
+            if (id(co2).state < ${co2_good})  return lv_color_hex(s.co2_good);
+            if (id(co2).state < ${co2_bad}) return lv_color_hex(s.co2_warn);
+            return lv_color_hex(s.co2_bad);
+
+      # HEAT button: lit = filled orange, ON/OFF underneath.
+      - lvgl.widget.update:
+          id: btn_heat
+          bg_grad_dir: HOR
+          bg_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(heat_state).state) ? l.heat.bg : l.btn);
+          bg_grad_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(heat_state).state) ? l.heat.bg2 : l.btn);
+          border_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(heat_state).state) ? l.heat.line : l.btn_line);
+          shadow_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).heat.line);'
+          shadow_opa: 45%
+          shadow_width: !lambda |-
+            return is_on(id(heat_state).state) ? cyd_look(id(skin)).glow : 0;
+      - lvgl.widget.update:
+          id: bar_heat
+          bg_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            if (!(is_on(id(heat_state).state))) return lv_color_hex(l.btn);   // off: no bar, only a lit tile has one
+            return lv_color_hex(l.glow == 0 ? l.heat.bg : l.heat.line);
+          shadow_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).heat.line);'
+          shadow_opa: 80%
+          shadow_width: !lambda |-
+            return is_on(id(heat_state).state) ? cyd_look(id(skin)).glow / 2 : 0;
+      - lvgl.label.update:
+          id: lbl_heat
+          text: !lambda |-
+            if (id(heat_state).state.empty()) return std::string("n/a");
+            return is_on(id(heat_state).state) ? std::string("ON")
+                                                 : std::string("OFF");
+          text_font: f_state        # undo the hint's smaller font
+          text_color: !lambda |-
+            return is_on(id(heat_state).state) ? lv_color_hex(cyd_look(id(skin)).heat.text)
+                                                 : lv_color_hex(cyd_skin(id(skin)).dim);
+
+      # AC button: stays dark with "n/d" until the entity exists.
+      - lvgl.widget.update:
+          id: btn_cool
+          bg_grad_dir: HOR
+          bg_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(cool_state).state) ? l.cool.bg : l.btn);
+          bg_grad_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(cool_state).state) ? l.cool.bg2 : l.btn);
+          border_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            return lv_color_hex(is_on(id(cool_state).state) ? l.cool.line : l.btn_line);
+          shadow_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).cool.line);'
+          shadow_opa: 45%
+          shadow_width: !lambda |-
+            return is_on(id(cool_state).state) ? cyd_look(id(skin)).glow : 0;
+      - lvgl.widget.update:
+          id: bar_cool
+          bg_color: !lambda |-
+            const CydLook l = cyd_look(id(skin));
+            if (!(is_on(id(cool_state).state))) return lv_color_hex(l.btn);   // off: no bar, only a lit tile has one
+            return lv_color_hex(l.glow == 0 ? l.cool.bg : l.cool.line);
+          shadow_color: !lambda 'return lv_color_hex(cyd_look(id(skin)).cool.line);'
+          shadow_opa: 80%
+          shadow_width: !lambda |-
+            return is_on(id(cool_state).state) ? cyd_look(id(skin)).glow / 2 : 0;
+      - lvgl.label.update:
+          id: lbl_cool
+          text: !lambda |-
+            if (id(cool_state).state.empty()) return std::string("n/a");
+            return is_on(id(cool_state).state) ? std::string("ON")
+                                              : std::string("OFF");
+          text_font: f_state
+          text_color: !lambda |-
+            return is_on(id(cool_state).state) ? lv_color_hex(cyd_look(id(skin)).cool.text)
+                                              : lv_color_hex(cyd_skin(id(skin)).dim);
+
+      - lvgl.widget.update:
+          id: ico_ha
+          image_recolor: !lambda |-
+            return id(ha_link).state ? lv_color_hex(0x38BDF8)   // light blue: connected
+                                     : lv_color_hex(0x8B98A5);  // grey: disconnected
+
+      # ---- fixed captions
+      - lvgl.label.update:
+          id: lbl_ttl_heat
+          text: !lambda 'return std::string("HEAT");'
+      - lvgl.label.update:
+          id: lbl_ttl_cool
+          text: !lambda 'return std::string("COOL");'
+      - lvgl.label.update:
+          id: lbl_set_title
+          text: !lambda 'return std::string("SETTINGS");'
+      - lvgl.label.update:
+          id: lbl_cap_pass
+          text: !lambda 'return std::string("PASSWORD");'
+      - lvgl.label.update:
+          id: lbl_save
+          text: !lambda 'return std::string("SAVE");'
+      - lvgl.textarea.update:
+          id: ta_ssid
+          placeholder_text: !lambda 'return std::string("wifi network");'
+      # ---- calibration page
+      - lvgl.label.update:
+          id: lbl_cal_title
+          text: !lambda 'return std::string("CALIBRATION");'
+      - lvgl.label.update:
+          id: lbl_co2_cal
+          text: !lambda 'return std::string("HOLD: CO2 = 420 OUTDOORS");'
+      - lvgl.label.update:
+          id: lbl_cap_skin
+          text: !lambda 'return std::string("SKIN");'
+      - lvgl.label.update:
+          id: lbl_skin
+          text: !lambda |-
+            switch (id(skin)) {
+              case 1:  return std::string("NIGHT");
+              case 2:  return std::string("DAY");
+              case 3:  return std::string("COLOUR");
+              case 4:  return std::string("WARM NIGHT");
+              case 5:  return std::string("NOPATTERN");
+              default: return std::string("CONTRAST");
+            }
+      - lvgl.label.update:
+          id: lbl_temp_offset
+          text: !lambda 'return str_sprintf("%+.1f", id(temp_offset).state);'
+      - lvgl.label.update:
+          id: lbl_hum_offset
+          text: !lambda 'return str_sprintf("%+.1f", id(hum_offset).state);'
+      - lvgl.label.update:
+          id: lbl_co2_offset
+          text: !lambda 'return str_sprintf("%+.0f", id(co2_offset).state);'
+
+      # ---- screen page
+      - lvgl.label.update:
+          id: lbl_night_title
+          text: !lambda 'return std::string("SCREEN");'
+      - lvgl.label.update:
+          id: lbl_cap_mode
+          text: !lambda 'return std::string("AT NIGHT");'
+      - lvgl.label.update:
+          id: lbl_cap_bright
+          text: !lambda 'return std::string("BRIGHTNESS");'
+      - lvgl.label.update:
+          id: lbl_bright
+          text: !lambda 'return str_sprintf("%.0f%%", id(idle_bright).state);'
+      - lvgl.label.update:
+          id: lbl_cap_from
+          text: !lambda 'return std::string("FROM");'
+      - lvgl.label.update:
+          id: lbl_cap_to
+          text: !lambda 'return std::string("TO");'
+      - lvgl.label.update:
+          id: lbl_night_mode
+          text: !lambda |-
+            auto m = id(night_mode).current_option();
+            if (m == "Off") return std::string("OFF");
+            if (m == "Dim") return std::string("DIMMED");
+            return std::string("ALWAYS ON");
+      - lvgl.label.update:
+          id: lbl_night_from
+          text: !lambda 'return str_sprintf("%02d:%02d", id(night_from).hour, id(night_from).minute);'
+      - lvgl.label.update:
+          id: lbl_night_to
+          text: !lambda 'return str_sprintf("%02d:%02d", id(night_to).hour, id(night_to).minute);'
+      - lvgl.label.update:
+          id: lbl_cap_flip
+          text: !lambda 'return std::string("ROTATION");'
+      - lvgl.label.update:
+          id: lbl_flip
+          text: !lambda |-
+            return id(flip_screen).state ? std::string("FLIPPED")
+                                         : std::string("NORMAL");
+
+      # ---- alerts page
+      - lvgl.label.update:
+          id: lbl_alert_title
+          text: !lambda 'return std::string("ALERTS");'
+      - lvgl.label.update:
+          id: lbl_cap_at
+          text: !lambda 'return std::string("ALERT BELOW / ABOVE");'
+      - lvgl.label.update:
+          id: lbl_alert_temp_min
+          text: !lambda 'return str_sprintf("%.1f", id(alert_temp_min).state);'
+      - lvgl.label.update:
+          id: lbl_alert_hum_max
+          text: !lambda 'return str_sprintf("%.0f", id(alert_hum_max).state);'
+      - lvgl.label.update:
+          id: lbl_alert_co2_max
+          text: !lambda 'return str_sprintf("%.0f", id(alert_co2_max).state);'
+      # ---- tab bars (one copy per settings page)
+      - lvgl.label.update:
+          id: lbl_tab_cal_1
+          text: !lambda 'return std::string("CALIB.");'
+      - lvgl.label.update:
+          id: lbl_tab_night_1
+          text: !lambda 'return std::string("SCREEN");'
+      - lvgl.label.update:
+          id: lbl_tab_alert_1
+          text: !lambda 'return std::string("ALERTS");'
+      - lvgl.label.update:
+          id: lbl_tab_cal_2
+          text: !lambda 'return std::string("CALIB.");'
+      - lvgl.label.update:
+          id: lbl_tab_night_2
+          text: !lambda 'return std::string("SCREEN");'
+      - lvgl.label.update:
+          id: lbl_tab_alert_2
+          text: !lambda 'return std::string("ALERTS");'
+      - lvgl.label.update:
+          id: lbl_tab_cal_3
+          text: !lambda 'return std::string("CALIB.");'
+      - lvgl.label.update:
+          id: lbl_tab_night_3
+          text: !lambda 'return std::string("SCREEN");'
+      - lvgl.label.update:
+          id: lbl_tab_alert_3
+          text: !lambda 'return std::string("ALERTS");'
+      - lvgl.label.update:
+          id: lbl_tab_cal_4
+          text: !lambda 'return std::string("CALIB.");'
+      - lvgl.label.update:
+          id: lbl_tab_night_4
+          text: !lambda 'return std::string("SCREEN");'
+      - lvgl.label.update:
+          id: lbl_tab_alert_4
+          text: !lambda 'return std::string("ALERTS");'
